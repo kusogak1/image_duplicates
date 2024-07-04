@@ -25,12 +25,7 @@ use {
     },
 };
 
-#[derive(Debug, PartialEq)]
-enum Direction {
-    Forwards,
-    Backwards,
-    None,
-}
+mod chunk;
 
 const APPLICATION_NAME: &str = "Image duplicate finder";
 const UI_WINDOW_WIDTH: f32 = 1280.0;
@@ -49,14 +44,19 @@ const TILE_COUNT_PER_SIDE: u32 = 4;
 /// Not worth saving if the resemblance is too low, it will only slow down the process and generate unnecessary data.
 const CORRELATION_THRESHOLD: f32 = 0.95;
 
-lazy_static! {
-// TODO: Move arc mutexes from MyApp to here.
-static ref UNDO_LIST: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-static ref AUTO_FORWARD_DIRECTION: Arc<Mutex<Direction>> = Arc::new(Mutex::new(Direction::None));
-static ref MAX_WORKERS: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+#[derive(Debug, PartialEq)]
+enum Direction {
+    Forwards,
+    Backwards,
+    None,
 }
 
-mod chunk;
+lazy_static! {
+    // TODO: Move arc mutexes from MyApp to here.
+    static ref UNDO_LIST: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    static ref AUTO_FORWARD_DIRECTION: Arc<Mutex<Direction>> = Arc::new(Mutex::new(Direction::None));
+    static ref MAX_WORKERS: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+}
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -78,7 +78,7 @@ fn main() -> Result<()> {
         options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Box::<MyApp>::default()
+            Ok(Box::<MyApp>::default())
         }),
     );
     Ok(())
@@ -142,18 +142,19 @@ impl DataEntry {
         let mut file_list = Vec::new();
         visit_dirs(Path::new(folder_path), recursive, &mut |entry| {
             if let Some(extension) = entry.extension() {
-                match if let Some(ext) = extension.to_ascii_lowercase().to_str() {
-                    ext
-                } else {
-                    eprintln!("Could not get extention.");
-                    ""
-                } {
-                    "png" | "jpg" | "jpeg" => {
-                        if let Some(filepath) = entry.to_str() {
-                            file_list.push(filepath.to_string());
+                if let Some(ext) = extension.to_ascii_lowercase().to_str() {
+                    match ext {
+                        "png" | "jpg" | "jpeg" => {
+                            if let Some(filepath) = entry.to_str() {
+                                file_list.push(filepath.to_string());
+                            } else {
+                                eprintln!("Could not convert file path to string for entry: {entry:?}");
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
+                } else {
+                    eprintln!("Could not get file extension as a string for entry: {entry:?}");
                 }
             }
         });
@@ -520,57 +521,6 @@ impl CorrelationEntry {
     }
 }
 
-fn visit_dirs(folder_path: &Path, recursive: bool, callback: &mut dyn FnMut(&PathBuf)) {
-    if folder_path.is_dir() {
-        // Do not check our created folder
-        if folder_path.display().to_string().contains(POTENTIAL_DUPLICATES_FOLDER) {
-            return;
-        }
-        for entry in fs::read_dir(folder_path).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if path.is_dir() && recursive {
-                visit_dirs(&path, recursive, callback);
-            } else {
-                callback(&path);
-            }
-        }
-    }
-}
-
-fn create_ui_image_component(ui: &mut Ui, file_path: &str, image: egui::Image, max_size: (f32, f32), to_delete: &Arc<Mutex<String>>, root_folder: &str) {
-    let filename = Path::new(&file_path).file_name().unwrap().to_str().unwrap();
-    let display_filename = shorten_string(filename, 40);
-    let scaled_image = image.fit_to_original_size(1.0).max_width(max_size.0).max_height(max_size.1).sense(Sense::click());
-    let duplicate_folder_path = format!("{root_folder}/{POTENTIAL_DUPLICATES_FOLDER}");
-    ui.vertical(|ui| {
-        match ImageReader::open(file_path) {
-            Ok(image) => {
-                let dim = image.into_dimensions().expect("Could not get dimensions");
-                if ui.add(scaled_image).clicked() {
-                    if !Path::new(&duplicate_folder_path).exists() {
-                        let _ = fs::create_dir(&duplicate_folder_path);
-                    }
-                    {
-                        let mut u_list = UNDO_LIST.lock();
-                        u_list.push(file_path.to_string());
-                    }
-                    let _ = fs::rename(file_path, format!("{duplicate_folder_path}/{filename}"));
-                    let mut binding = to_delete.lock();
-                    *binding = file_path.to_string();
-                }
-                ui.label(display_filename);
-                ui.label(format!("Parent folder: {}", Path::new(file_path).parent().unwrap().file_name().unwrap().to_str().unwrap()));
-                ui.label(format!("Image dimensions: {}x{}", dim.0, dim.1));
-            }
-            Err(e) => {
-                /*eprint!("Could not open image {e}")*/
-                drop(e);
-            }
-        };
-    });
-}
-
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_pixels_per_point(1.5);
@@ -739,21 +689,23 @@ impl eframe::App for MyApp {
                             let mut idx = correlation_entry_idx.lock();
                             let c_data = correlation_data.lock();
 
-                            if *direction == Direction::Forwards {
-                                if *idx < (c_data.len() - 1) {
-                                    *idx += 1;
-                                } else {
-                                    *idx = 0;
+                            match *direction {
+                                Direction::Forwards => {
+                                    if *idx < (c_data.len() - 1) {
+                                        *idx += 1;
+                                    } else {
+                                        *idx = 0;
+                                    }
                                 }
-                            } else if *direction == Direction::Backwards {
-                                if *idx > 0 {
-                                    *idx -= 1;
-                                } else {
-                                    *idx = c_data.len() - 1;
+                                Direction::Backwards => {
+                                    if *idx > 0 {
+                                        *idx -= 1;
+                                    } else {
+                                        *idx = c_data.len() - 1;
+                                    }
                                 }
-                            } else {
-                                *direction = Direction::Forwards;
-                            }
+                                Direction::None => *direction = Direction::Forwards,
+                            };
 
                             {
                                 let entry = c_data.get(*idx).expect("Somehow the index got out of bounds");
@@ -808,21 +760,68 @@ impl eframe::App for MyApp {
     }
 }
 
+fn visit_dirs(folder_path: &Path, recursive: bool, callback: &mut dyn FnMut(&PathBuf)) {
+    if folder_path.is_dir() {
+        // Do not check our created folder
+        if folder_path.display().to_string().contains(POTENTIAL_DUPLICATES_FOLDER) {
+            return;
+        }
+        for entry in fs::read_dir(folder_path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() && recursive {
+                visit_dirs(&path, recursive, callback);
+            } else {
+                callback(&path);
+            }
+        }
+    }
+}
+
+fn create_ui_image_component(ui: &mut Ui, file_path: &str, image: egui::Image, max_size: (f32, f32), to_delete: &Arc<Mutex<String>>, root_folder: &str) {
+    let filename = Path::new(&file_path).file_name().unwrap().to_str().unwrap();
+    let display_filename = shorten_string(filename, 40);
+    let scaled_image = image.fit_to_original_size(1.0).max_width(max_size.0).max_height(max_size.1).sense(Sense::click());
+    let duplicate_folder_path = format!("{root_folder}/{POTENTIAL_DUPLICATES_FOLDER}");
+    ui.vertical(|ui| {
+        match ImageReader::open(file_path) {
+            Ok(image) => {
+                let dim = image.into_dimensions().expect("Could not get dimensions");
+                if ui.add(scaled_image).clicked() {
+                    if !Path::new(&duplicate_folder_path).exists() {
+                        let _ = fs::create_dir(&duplicate_folder_path);
+                    }
+                    {
+                        let mut u_list = UNDO_LIST.lock();
+                        u_list.push(file_path.to_string());
+                    }
+                    let _ = fs::rename(file_path, format!("{duplicate_folder_path}/{filename}"));
+                    let mut binding = to_delete.lock();
+                    *binding = file_path.to_string();
+                }
+                ui.label(display_filename);
+                ui.label(format!("Parent folder: {}", shorten_string(Path::new(file_path).parent().unwrap().file_name().unwrap().to_str().unwrap(), 30)));
+                ui.label(format!("Image dimensions: {}x{}", dim.0, dim.1));
+            }
+            Err(e) => {
+                /*eprint!("Could not open image {e}")*/
+                drop(e);
+            }
+        };
+    });
+}
+
 // Will shorten the string, so that the middle part is not displayed if its too long
 fn shorten_string(input_string: &str, max_length: usize) -> String {
     if input_string.len() <= max_length {
-        input_string.to_string()
-    } else {
-        let input_len = input_string.len();
-        let diff = input_len - max_length;
-        let middle_idx = 1 + max_length / 2;
-        let first_cutoff = &input_string[..middle_idx - 1];
-        let second_cutoff = &input_string[middle_idx + diff..];
-        let mut result = String::from(first_cutoff);
-        result.push('…');
-        result.push_str(second_cutoff);
-        result
+        return input_string.to_string();
     }
+
+    let half_length = (max_length - 1) / 2; // -1 accounts for the ellipsis
+    let start_slice = &input_string[..=half_length];
+    let end_slice = &input_string[input_string.len() - half_length..];
+
+    format!("{start_slice}…{end_slice}")
 }
 
 #[cfg(test)]
